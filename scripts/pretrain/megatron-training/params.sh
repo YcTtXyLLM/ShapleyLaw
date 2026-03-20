@@ -90,6 +90,7 @@ ALL_PARAMS+=(
 # Dataset
 # --------------------------------------------------
 ALL_PARAMS+=(
+    --data-path ${TRAIN_DATA_PATH}
     --data-cache-path ${DATA_CACHE_PATH}
 )
 
