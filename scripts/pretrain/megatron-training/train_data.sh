@@ -1,1 +1,2 @@
-
+export TRAIN_DATA_PATH="YOUR TRAIN_DATA_PATH with mixture ratios"
+export TEST_DATA_PATH="YOUR TEST_DATA_PATH"
