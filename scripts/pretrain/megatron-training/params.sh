@@ -1,4 +1,4 @@
-# Pretraining configuration (Transformer-based language model. Following is the example for 1.46B model, please find more configurations for other model sizes in our paper.)
+# Pretraining configuration (Transformer-based language model. Following is an example for 1.46B model, please find more configurations for other model sizes in our paper.)
 
 ALL_PARAMS=()
 
