@@ -112,9 +112,7 @@ from . import one_logger_utils
 from . import ft_integration
 
 from megatron.core import parallel_state
-import os
 import csv
-import math
 
 stimer = StragglerDetector()
 
@@ -1537,7 +1535,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
     opt_stats = [0.0] * 8
     opt_stats_2 = [0.0] * 4
     if optimizer is not None:
-        # https://github.com/llm-jp/Megatron-LM/blob/3a8b91c311ab96043c8f1a57294ec7ad3ee806a8/megatron/core/optimizer/__init__.py#L421-L445
+        # Optimizer-state logging for expert-parallel optimizers.
         # For expert_parallel
         if isinstance(optimizer, ChainedOptimizer):
             for opt in optimizer.chained_optimizers:
@@ -2435,7 +2433,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
     # ===================== NEW: prepare output file =====================
     GLOBAL_CSV_DIR = os.environ.get(
         "EVAL_OUTPUT_DIR",
-        "/groups/gcg51557/experiments/0257_MLLM_Scaling_Law/tasks/pretrain_SIZE_test",
+        os.path.join(os.getcwd(), "eval_outputs"),
     )
 
     GLOBAL_CSV_FILE = os.environ.get("EVAL_OUTPUT_FILE") or os.path.join(
