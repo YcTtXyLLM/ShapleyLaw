@@ -3,9 +3,6 @@
 
 import torch
 from functools import partial
-from contextlib import nullcontext
-import inspect
-
 from typing import List, Optional, Tuple, Union
 from megatron.training import get_args
 from megatron.training import print_rank_0
@@ -38,8 +35,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
-from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
-
 import os
 
 from megatron_inrun_language_shapley import (
@@ -52,7 +47,6 @@ from megatron_inrun_language_shapley import (
 # ---------------------------------------------------------------------
 
 _SHAPLEY = None
-# _TARGET_VALID_ITERATOR = None
 _SHAPLEY_INITIALIZED = False
 
 
@@ -160,24 +154,6 @@ def get_batch(data_iterator):
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
-    if (
-        torch.distributed.is_available()
-        and torch.distributed.is_initialized()
-        and torch.distributed.get_rank() == 0
-        and not hasattr(get_args(), "_printed_raw_batch_keys")
-    ):
-        get_args()._printed_raw_batch_keys = True
-        print(
-            "[InRunShapley debug] raw batch keys after TP:",
-            list(batch.keys()),
-            flush=True,
-        )
-        print(
-            "[InRunShapley debug] raw language_id:",
-            batch.get("language_id", None),
-            flush=True,
-        )
-
     # Metadata for In-Run Data Shapley.
     # Do not pass these into the model forward.
     language_id = batch.pop("language_id", None)
@@ -296,20 +272,6 @@ def forward_step(data_iterator, model: GPTModel):
         "language_id": language_id,
     }
 
-    # Optional debug: verify language_id is correctly attached.
-    if (
-        getattr(args, "inrun_shapley_debug", False)
-        and language_id is not None
-        and torch.distributed.is_available()
-        and torch.distributed.is_initialized()
-        and torch.distributed.get_rank() == 0
-    ):
-        print(
-            "[InRunShapley debug] language_id:",
-            language_id.detach().cpu().tolist(),
-            flush=True,
-        )
-
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(
@@ -383,10 +345,10 @@ def maybe_init_inrun_shapley(model):
 
     languages = [
         x.strip()
-        for x in os.environ.get("MEGATRON_INRUN_SHAPLEY_LANGUAGES", "en,fr,de,es,zh,ja,ko").split(",")
+        for x in os.environ.get("MEGATRON_INRUN_SHAPLEY_LANGUAGES", "lang_a,lang_b,lang_c").split(",")
         if x.strip()
     ]
-    target_language = os.environ.get("MEGATRON_INRUN_SHAPLEY_TARGET_LANGUAGE", "zh")
+    target_language = os.environ.get("MEGATRON_INRUN_SHAPLEY_TARGET_LANGUAGE", "lang_a")
     attribute_every = int(os.environ.get("MEGATRON_INRUN_SHAPLEY_ATTRIBUTE_EVERY", "100"))
     activation_layout = os.environ.get("MEGATRON_INRUN_SHAPLEY_ACTIVATION_LAYOUT", "SBH")
 
@@ -469,7 +431,7 @@ def maybe_run_inrun_shapley(iteration, model, optimizer, valid_data_iterator):
 
     Required training.py hook, after iteration increments:
         try:
-            from pretrain_gpt_inrun_shapley import maybe_run_inrun_shapley
+            from <this_script_module> import maybe_run_inrun_shapley
             maybe_run_inrun_shapley(iteration, model, optimizer, valid_data_iterator)
         except Exception as e:
             print_rank_0(f"[InRunShapley] hook failed: {e}")
@@ -603,7 +565,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
-    # Temporary for transition to core datasets
+    # Enable distributed dataset construction.
     train_valid_test_datasets_provider.is_distributed = True
 
     pretrain(
