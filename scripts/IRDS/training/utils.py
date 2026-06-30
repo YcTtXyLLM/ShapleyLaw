@@ -173,7 +173,8 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                                         group=mpu.get_expert_data_parallel_group())
     # Account for MoE norm even if current rank doesn't have any expert params to prevent
     # hang in models with un-even numbers of MoE layers.
-    # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
+    # Keep a zero contribution on ranks without expert parameters to avoid
+    # collective communication mismatches in uneven MoE configurations.
     else:
         moe_norm_2 = torch.zeros_like(norm_2)
 
@@ -409,9 +410,8 @@ def append_to_progress_log(string, barrier=True):
         torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
         with open(progress_log_filename, 'a') as f:
-            job_id = os.getenv('SLURM_JOB_ID', '')
             num_gpus = args.world_size
-            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\t"
                     f"# GPUs: {num_gpus}\t{string}\n")
 
 
@@ -474,7 +474,7 @@ def get_batch_on_this_tp_rank(data_iterator):
     # In-Run Data Shapley metadata switch.
     # These are sequence-level metadata fields. They should be broadcast across
     # tensor-parallel ranks together with the normal GPT batch, but should NOT be
-    # sliced by context parallelism. pretrain_gpt_inrun_shapley.py pops them
+    # sliced by context parallelism. The pretraining entrypoint pops them
     # before get_batch_on_this_cp_rank().
     inrun_shapley_enabled = os.environ.get("MEGATRON_INRUN_SHAPLEY_ENABLE", "0") == "1"
 
