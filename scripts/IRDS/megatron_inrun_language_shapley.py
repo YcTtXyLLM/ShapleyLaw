@@ -1,731 +1,586 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+"""Pretrain GPT with optional language-level attribution.
+
+This public version has been anonymized to avoid exposing user-, host-,
+or environment-specific information. Runtime-specific values should be
+provided through command-line arguments or environment variables.
 """
-Megatron-LM friendly language-level In-Run Data Shapley helper.
-
-Goal
-----
-During multilingual LLM pretraining, estimate how much each training language
-contributes to the model's performance on ONE target validation language.
-
-For each attribution micro-step, this module computes a 7-dimensional vector:
-
-    lang_score[l] += sum_{samples i with language_id=l}
-                     -lr_t * <grad loss_val_target, grad loss_train_i>
-
-This is the first-order In-Run Data Shapley approximation from
-"Data Shapley in One Training Run".
-
-Recommended use
----------------
-1. Keep your Megatron-LM pretraining loop unchanged.
-2. Add a language_id to each sequence in your FineWeb2 multilingual dataset.
-3. Create a held-out validation iterator for the target language.
-4. Every N training iterations, run one attribution micro-step with this helper.
-5. Save language-level cumulative scores to JSONL/CSV.
-
-Important engineering assumptions
----------------------------------
-- The model is Megatron GPT-style and returns per-token losses when labels are
-  passed, as in Megatron-LM pretrain_gpt.py.
-- Sequence lengths of train and target-validation batches are the same.
-- This file supports normal dense micro-batches, not packed THD/SFT batches.
-- Hooks target Linear-like modules with a 2D weight parameter, including
-  torch.nn.Linear and Megatron tensor-parallel linear modules.
-- Works best with tensor parallel + data parallel. Pipeline parallel can work
-  if all PP stages run the attribution forward/backward and receive language_id;
-  otherwise start with pipeline-model-parallel-size=1 for attribution runs.
-- Bias attribution is disabled by default because Megatron TP layers may shard
-  or fuse bias differently. Weight-only attribution is usually the important part.
-
-Suggested Megatron patch points
--------------------------------
-In your custom pretrain_gpt.py:
-    - after model creation: create LanguageInRunShapley(...)
-    - inside the training loop, every args.shapley_attribute_every:
-          train_batch = get the current micro-batch, including language_id
-          val_batch = next(target_language_valid_iterator)
-          shapley.attribute(...)
-    - periodically call shapley.write_jsonl(...)
-"""
-
-from __future__ import annotations
-
-import json
-import time
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
-import torch.distributed as dist
-import torch.nn as nn
+from functools import partial
+from typing import List, Optional, Tuple, Union
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
+from megatron.core import mpu
+from megatron.core.enums import ModelType
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+    get_gpt_heterogeneous_layer_spec,
+)
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+import megatron.legacy.model
+from megatron.core.models.gpt import GPTModel
+from megatron.training import pretrain
+from megatron.core.utils import StragglerDetector
+from megatron.core.transformer.spec_utils import import_module
+from megatron.training.utils import (
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+    get_blend_and_blend_per_split,
+)
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+
+import os
 
-
-try:
-    from megatron.core import parallel_state
-except Exception:
-    parallel_state = None
-
-
-TensorBatch = Dict[str, torch.Tensor]
-
-
-# ---------------------------------------------------------------------
-# Distributed utilities
-# ---------------------------------------------------------------------
-
-def _is_dist_ready() -> bool:
-    return dist.is_available() and dist.is_initialized()
-
-
-def _safe_group(fn_name: str):
-    if parallel_state is None:
-        return None
-    fn = getattr(parallel_state, fn_name, None)
-    if fn is None:
-        return None
-    try:
-        return fn()
-    except Exception:
-        return None
-
-
-def _all_reduce_sum_(x: torch.Tensor, group=None) -> torch.Tensor:
-    if _is_dist_ready():
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
-    return x
-
-
-def _get_rank() -> int:
-    return dist.get_rank() if _is_dist_ready() else 0
-
-
-def _is_global_rank0() -> bool:
-    return _get_rank() == 0
-
-
-def reduce_scores_for_megatron_(
-    lang_scores: torch.Tensor,
-    lang_token_counts: torch.Tensor,
-    reduce_tensor_parallel: bool = True,
-    reduce_pipeline_parallel: bool = True,
-    reduce_data_parallel: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Reduce language scores and counts in a Megatron-friendly way.
-
-    Scores:
-      - Sum over TP because each TP rank owns a shard of parameters.
-      - Sum over PP because each PP stage owns a subset of layers.
-      - Sum over DP because each DP rank sees different samples.
-
-    Counts:
-      - Sum over DP only.
-      - Do NOT sum over TP/PP, because TP/PP ranks usually see the same samples.
-    """
-    if not _is_dist_ready():
-        return lang_scores, lang_token_counts
-
-    if reduce_tensor_parallel:
-        group = _safe_group("get_tensor_model_parallel_group")
-        _all_reduce_sum_(lang_scores, group=group)
-
-    if reduce_pipeline_parallel:
-        group = _safe_group("get_pipeline_model_parallel_group")
-        _all_reduce_sum_(lang_scores, group=group)
-
-    if reduce_data_parallel:
-        group = _safe_group("get_data_parallel_group")
-        _all_reduce_sum_(lang_scores, group=group)
-        _all_reduce_sum_(lang_token_counts, group=group)
-
-    return lang_scores, lang_token_counts
-
-
-# ---------------------------------------------------------------------
-# Batch helpers
-# ---------------------------------------------------------------------
-
-def cat_batch_dim(a: torch.Tensor, b: torch.Tensor, batch_dim: int = 0) -> torch.Tensor:
-    return torch.cat([a, b], dim=batch_dim)
-
-
-def build_combined_gpt_batch(
-    train_batch: TensorBatch,
-    val_batch: TensorBatch,
-    keys: Sequence[str] = ("tokens", "labels", "loss_mask", "position_ids"),
-    batch_dim: int = 0,
-) -> TensorBatch:
-    """
-    Build a combined train+validation batch for a Megatron GPT forward.
-
-    The common Megatron GPT batch contains:
-      tokens, labels, loss_mask, attention_mask, position_ids
-
-    attention_mask is often shared/broadcasted and should usually NOT be
-    concatenated along batch. We keep train_batch["attention_mask"] by default.
-    """
-    combined: TensorBatch = {}
-
-    for k in keys:
-        if k in train_batch and k in val_batch and train_batch[k] is not None:
-            combined[k] = cat_batch_dim(train_batch[k], val_batch[k], batch_dim=batch_dim)
-
-    if "attention_mask" in train_batch:
-        combined["attention_mask"] = train_batch["attention_mask"]
-
-    if train_batch.get("packed_seq_params", None) is not None:
-        raise NotImplementedError("Packed THD/SFT batches are not supported by this helper yet.")
-
-    return combined
-
-
-def sequence_loss_from_token_losses(
-    token_losses: torch.Tensor,
-    loss_mask: torch.Tensor,
-    batch_dim: int = 0,
-    normalize_by_tokens: bool = True,
-) -> torch.Tensor:
-    """
-    Convert Megatron per-token losses into one scalar loss per sequence.
-
-    Megatron GPT commonly returns output_tensor that can be viewed like loss_mask.
-    loss_mask is usually [B, S] when batch_dim=0.
-    """
-    losses = token_losses.float().view_as(loss_mask).float()
-    mask = loss_mask.float()
-
-    if batch_dim != 0:
-        losses = losses.transpose(0, batch_dim).contiguous()
-        mask = mask.transpose(0, batch_dim).contiguous()
-
-    seq_loss = (losses * mask).sum(dim=1)
-    if normalize_by_tokens:
-        seq_loss = seq_loss / mask.sum(dim=1).clamp_min(1.0)
-    return seq_loss
-
-
-# ---------------------------------------------------------------------
-# Ghost dot-product hook
-# ---------------------------------------------------------------------
-
-@dataclass
-class GhostHookConfig:
-    num_languages: int = 7
-    activation_layout: str = "SBH"  # Megatron hidden states are commonly [seq, batch, hidden].
-    include_bias: bool = False
-    require_grad_output: bool = True
-    fp32_accumulation: bool = True
-    min_weight_ndim: int = 2
-
-
-class MegatronLinearGhostDot:
-    """
-    Ghost dot-product for Linear-like modules.
-
-    It accumulates per-training-sequence dot-products with the aggregate
-    target-validation gradient. It does not instantiate per-sample gradients.
-
-    Supported activation layouts:
-      - "SBH": activation shape [seq, batch, hidden]
-      - "BSH": activation shape [batch, seq, hidden]
-      - "BH":  activation shape [batch, hidden]
-
-    The combined batch must place training sequences first and validation
-    sequences second.
-    """
-
-    def __init__(self, model: nn.Module, config: GhostHookConfig):
-        self.model = model
-        self.config = config
-        self.handles: List[torch.utils.hooks.RemovableHandle] = []
-        self.enabled: bool = False
-        self.train_batch_size: Optional[int] = None
-        self._inputs: Dict[int, torch.Tensor] = {}
-        self._sample_dots: Optional[torch.Tensor] = None
-
-    def install(self) -> None:
-        self.remove()
-        for module in self.model.modules():
-            if self._is_linear_like(module):
-                self.handles.append(module.register_forward_hook(self._save_input))
-                self.handles.append(module.register_full_backward_hook(self._accumulate_dot))
-
-    def remove(self) -> None:
-        for h in self.handles:
-            h.remove()
-        self.handles.clear()
-
-    def begin(self, train_batch_size: int, device: torch.device) -> None:
-        self.enabled = True
-        self.train_batch_size = int(train_batch_size)
-        self._inputs.clear()
-        self._sample_dots = torch.zeros(train_batch_size, device=device, dtype=torch.float32)
-
-    def end(self) -> torch.Tensor:
-        if self._sample_dots is None:
-            raise RuntimeError("No ghost dot-products were accumulated.")
-        out = self._sample_dots.detach().clone()
-        self.enabled = False
-        self.train_batch_size = None
-        self._inputs.clear()
-        self._sample_dots = None
-        return out
-
-    def _is_linear_like(self, module: nn.Module) -> bool:
-        w = getattr(module, "weight", None)
-        # Only modules with matrix-like weights can use the Linear ghost formula.
-        # This includes torch.nn.Linear and Megatron/Transformer-Engine parallel
-        # linear variants. Embeddings also have 2D weights, but their input is
-        # integer-valued; _save_input() filters those out.
-        return isinstance(w, torch.Tensor) and w.ndim == 2
-
-    def _save_input(self, module: nn.Module, inputs: Tuple[torch.Tensor, ...], output) -> None:
-        if not self.enabled:
-            return
-        if not inputs or not torch.is_tensor(inputs[0]):
-            return
-        # Skip embeddings and other modules whose input is not an activation.
-        if not inputs[0].is_floating_point():
-            return
-        self._inputs[id(module)] = inputs[0]
-
-    @torch.no_grad()
-    def _accumulate_dot(self, module: nn.Module, grad_input, grad_output) -> None:
-        if not self.enabled or self.train_batch_size is None or self._sample_dots is None:
-            return
-
-        A = self._inputs.pop(id(module), None)
-        if A is None:
-            return
-
-        G = None
-        if isinstance(grad_output, tuple):
-            for item in grad_output:
-                if torch.is_tensor(item):
-                    G = item
-                    break
-        elif torch.is_tensor(grad_output):
-            G = grad_output
-
-        if G is None:
-            if self.config.require_grad_output:
-                raise RuntimeError(f"Missing grad_output for module {module.__class__.__name__}")
-            return
-
-        A = A.detach()
-        G = G.detach()
-        if self.config.fp32_accumulation:
-            A = A.float()
-            G = G.float()
-
-        normalized = self._to_positions_batch_feature(A, G, module)
-        if normalized is None:
-            return
-        A, G = normalized
-
-        B = self.train_batch_size
-        if A.shape[1] <= B:
-            raise RuntimeError(
-                f"Combined batch size must be > train_batch_size. "
-                f"Got activation batch={A.shape[1]}, train_batch={B}."
-            )
-        if G.shape[1] != A.shape[1] or G.shape[0] != A.shape[0]:
-            # Some fused TE modules expose auxiliary tensors whose activation and
-            # grad-output positions do not align with the Linear weight. They are
-            # skipped rather than breaking attribution.
-            return
-
-        A_train, A_val = A[:, :B, :], A[:, B:, :]
-        G_train, G_val = G[:, :B, :], G[:, B:, :]
-
-        # F.linear convention: weight is [out, in]. P is the flattened position
-        # axis: sequence positions plus any extra non-feature dimensions.
-        val_w_grad = torch.einsum("pvo,pvi->oi", G_val, A_val)
-        dots = torch.einsum("pbo,pbi,oi->b", G_train, A_train, val_w_grad)
-
-        if self.config.include_bias and getattr(module, "bias", None) is not None:
-            val_b_grad = G_val.sum(dim=(0, 1))
-            dots = dots + torch.einsum("pbo,o->b", G_train, val_b_grad)
-
-        self._sample_dots.add_(dots.to(self._sample_dots.dtype))
-
-    @staticmethod
-    def _prod(xs: Tuple[int, ...]) -> int:
-        out = 1
-        for x in xs:
-            out *= int(x)
-        return out
-
-    def _flatten_activation(
-        self,
-        x: torch.Tensor,
-        expected_feature_dim: int,
-        layout: str,
-    ) -> Optional[torch.Tensor]:
-        """Return x as [P, B, C] for a Linear-like module.
-
-        P is a flattened position axis, B is the combined train+validation
-        batch axis, and C is the Linear input/output feature dimension.
-
-        Transformer Engine sometimes exposes tensors such as [S, B, Hh, Dh],
-        where Hh*Dh is a split feature dimension rather than an extra position
-        dimension. This function uses the module weight shape to distinguish:
-          - if product(trailing dims) == expected_feature_dim, trailing dims are
-            a split feature dimension and P remains S;
-          - if last dim == expected_feature_dim, intermediate trailing dims are
-            true extra positions and are folded into P.
-        """
-        layout = layout.upper()
-
-        if layout == "SBH":
-            if x.ndim == 2:
-                # [B, C] -> [1, B, C]
-                if x.shape[-1] != expected_feature_dim:
-                    return None
-                return x.unsqueeze(0).contiguous()
-            if x.ndim < 3:
-                return None
-            s, b = int(x.shape[0]), int(x.shape[1])
-            rest = tuple(int(v) for v in x.shape[2:])
-            if self._prod(rest) == expected_feature_dim:
-                return x.reshape(s, b, expected_feature_dim).contiguous()
-            if rest[-1] == expected_feature_dim:
-                pos = self._prod(rest[:-1])
-                return x.reshape(s, b, pos, expected_feature_dim).permute(0, 2, 1, 3).reshape(s * pos, b, expected_feature_dim).contiguous()
-            return None
-
-        if layout == "BSH":
-            if x.ndim == 2:
-                # [B, C] -> [1, B, C]
-                if x.shape[-1] != expected_feature_dim:
-                    return None
-                return x.unsqueeze(0).contiguous()
-            if x.ndim < 3:
-                return None
-            b, s = int(x.shape[0]), int(x.shape[1])
-            rest = tuple(int(v) for v in x.shape[2:])
-            if self._prod(rest) == expected_feature_dim:
-                return x.reshape(b, s, expected_feature_dim).transpose(0, 1).contiguous()
-            if rest[-1] == expected_feature_dim:
-                pos = self._prod(rest[:-1])
-                return x.reshape(b, s, pos, expected_feature_dim).permute(1, 2, 0, 3).reshape(s * pos, b, expected_feature_dim).contiguous()
-            return None
-
-        if layout == "BH":
-            if x.ndim < 2:
-                return None
-            b = int(x.shape[0])
-            rest = tuple(int(v) for v in x.shape[1:])
-            if self._prod(rest) == expected_feature_dim:
-                return x.reshape(1, b, expected_feature_dim).contiguous()
-            if rest[-1] == expected_feature_dim:
-                pos = self._prod(rest[:-1])
-                return x.reshape(b, pos, expected_feature_dim).permute(1, 0, 2).contiguous()
-            return None
-
-        raise ValueError(f"Unsupported activation_layout={self.config.activation_layout}")
-
-    def _to_positions_batch_feature(
-        self,
-        A: torch.Tensor,
-        G: torch.Tensor,
-        module: nn.Module,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        weight = getattr(module, "weight", None)
-        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
-            return None
-
-        # F.linear convention: weight shape is [out_features, in_features].
-        out_features = int(weight.shape[0])
-        in_features = int(weight.shape[1])
-
-        layout = self.config.activation_layout.upper()
-        A2 = self._flatten_activation(A, in_features, layout)
-        G2 = self._flatten_activation(G, out_features, layout)
-        if A2 is None or G2 is None:
-            return None
-        return A2, G2
-
-
-# ---------------------------------------------------------------------
-# Main language-level accumulator
-# ---------------------------------------------------------------------
-
-@dataclass
-class LanguageShapleyConfig:
-    languages: List[str]
-    target_language: str
-    attribute_every: int = 100
-    normalize_loss_by_tokens: bool = True
-    activation_layout: str = "SBH"
-    include_bias: bool = False
-    reduce_tensor_parallel: bool = True
-    reduce_pipeline_parallel: bool = True
-    reduce_data_parallel: bool = True
-    jsonl_flush_every: int = 100
-
-
-class LanguageInRunShapley:
-    """
-    Language-level first-order In-Run Data Shapley accumulator.
-
-    The class aggregates per-sequence increments into language buckets. For a
-    multilingual pretraining run with 7 FineWeb2 languages, the output is a
-    vector of length 7 for each target validation language.
-    """
-
-    def __init__(self, model: nn.Module, config: LanguageShapleyConfig, device: torch.device):
-        self.model = model
-        self.config = config
-        self.device = device
-
-        self.lang_to_id = {name: i for i, name in enumerate(config.languages)}
-        if config.target_language not in self.lang_to_id:
-            raise ValueError(f"target_language={config.target_language} not in languages={config.languages}")
-
-        self.ghost = MegatronLinearGhostDot(
-            model,
-            GhostHookConfig(
-                num_languages=len(config.languages),
-                activation_layout=config.activation_layout,
-                include_bias=config.include_bias,
-            ),
-        )
-        self.ghost.install()
-
-        n = len(config.languages)
-        self.cumulative_scores = torch.zeros(n, dtype=torch.float64)
-        self.cumulative_token_counts = torch.zeros(n, dtype=torch.float64)
-        self.cumulative_seen_sequences = torch.zeros(n, dtype=torch.float64)
-        self.num_attribute_steps = 0
-
-    def close(self) -> None:
-        self.ghost.remove()
-
-    def should_attribute(self, iteration: int) -> bool:
-        return self.config.attribute_every > 0 and iteration % self.config.attribute_every == 0
-
-    def attribute(
-        self,
-        train_batch: TensorBatch,
-        val_batch: TensorBatch,
-        lr: float,
-        iteration: int,
-        forward_model_with_batch,
-    ) -> Dict[str, float]:
-        """
-        Run one attribution micro-step.
-
-        Args:
-            train_batch:
-                Megatron-style batch with at least:
-                    tokens, labels, loss_mask, position_ids, attention_mask, language_id
-                language_id shape: [B], int in [0, num_languages).
-            val_batch:
-                Same structure for target-language held-out validation data.
-                language_id is not required for val_batch.
-            lr:
-                Current optimizer learning rate.
-            iteration:
-                Training iteration, for logging only.
-            forward_model_with_batch:
-                Callable:
-                    token_losses = forward_model_with_batch(combined_batch)
-
-                For Megatron GPT this is typically:
-                    def forward_model_with_batch(batch):
-                        return model(
-                            batch["tokens"],
-                            batch["position_ids"],
-                            batch["attention_mask"],
-                            labels=batch["labels"],
-                            loss_mask=batch["loss_mask"],
-                            packed_seq_params=None,
-                        )
-
-        Returns:
-            A dict of this-step language scores and token counts after distributed reduction.
-        """
-        if "language_id" not in train_batch:
-            raise KeyError('train_batch must contain "language_id" with shape [micro_batch_size].')
-
-        language_id = train_batch["language_id"].to(self.device).long()
-        train_loss_mask = train_batch["loss_mask"].to(self.device)
-        B = int(language_id.numel())
-
-        combined = build_combined_gpt_batch(train_batch, val_batch, batch_dim=0)
-        combined = {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v)
-                    for k, v in combined.items()}
-
-        combined_loss_mask = combined["loss_mask"]
-
-        self.model.zero_grad(set_to_none=True)
-        self.ghost.begin(train_batch_size=B, device=self.device)
-
-        token_losses = forward_model_with_batch(combined)
-        seq_losses = sequence_loss_from_token_losses(
-            token_losses=token_losses,
-            loss_mask=combined_loss_mask,
-            batch_dim=0,
-            normalize_by_tokens=self.config.normalize_loss_by_tokens,
-        )
-
-        # Backprop through train + target-validation losses. Hooks split the
-        # combined activations and compute train_i dot val_batch.
-        seq_losses.sum().backward()
-
-        sample_dots = self.ghost.end()
-        sample_increments = -float(lr) * sample_dots
-
-        n = len(self.config.languages)
-        lang_scores = torch.zeros(n, device=self.device, dtype=torch.float64)
-        lang_token_counts = torch.zeros(n, device=self.device, dtype=torch.float64)
-        lang_seen_sequences = torch.zeros(n, device=self.device, dtype=torch.float64)
-
-        token_counts = train_loss_mask.view(B, -1).sum(dim=1).to(self.device).double()
-
-        for l in range(n):
-            mask = language_id == l
-            if mask.any():
-                lang_scores[l] = sample_increments[mask].double().sum()
-                lang_token_counts[l] = token_counts[mask].sum()
-                lang_seen_sequences[l] = mask.double().sum()
-
-        reduce_scores_for_megatron_(
-            lang_scores,
-            lang_token_counts,
-            reduce_tensor_parallel=self.config.reduce_tensor_parallel,
-            reduce_pipeline_parallel=self.config.reduce_pipeline_parallel,
-            reduce_data_parallel=self.config.reduce_data_parallel,
-        )
-
-        # Sequence counts should only be reduced over DP, not TP/PP.
-        if _is_dist_ready() and self.config.reduce_data_parallel:
-            _all_reduce_sum_(lang_seen_sequences, group=_safe_group("get_data_parallel_group"))
-
-        self.cumulative_scores += lang_scores.detach().cpu()
-        self.cumulative_token_counts += lang_token_counts.detach().cpu()
-        self.cumulative_seen_sequences += lang_seen_sequences.detach().cpu()
-        self.num_attribute_steps += 1
-
-        self.model.zero_grad(set_to_none=True)
-
-        result = {
-            "iteration": int(iteration),
-            "target_language": self.config.target_language,
-            "lr": float(lr),
-            "num_attribute_steps": int(self.num_attribute_steps),
-        }
-        for i, lang in enumerate(self.config.languages):
-            result[f"step_score/{lang}"] = float(lang_scores[i].detach().cpu())
-            result[f"cum_score/{lang}"] = float(self.cumulative_scores[i])
-            result[f"cum_tokens/{lang}"] = float(self.cumulative_token_counts[i])
-            result[f"cum_sequences/{lang}"] = float(self.cumulative_seen_sequences[i])
-            result[f"score_per_1m_tokens/{lang}"] = (
-                float(self.cumulative_scores[i])
-                / max(float(self.cumulative_token_counts[i]), 1.0)
-                * 1_000_000.0
-            )
-            result[f"helpfulness_per_1m_tokens/{lang}"] = (
-                -float(self.cumulative_scores[i])
-                / max(float(self.cumulative_token_counts[i]), 1.0)
-                * 1_000_000.0
-            )
-        return result
-
-    def summary(self) -> Dict[str, object]:
-        rows = []
-        for i, lang in enumerate(self.config.languages):
-            tokens = float(self.cumulative_token_counts[i])
-            score = float(self.cumulative_scores[i])
-            rows.append({
-                "language": lang,
-                "target_language": self.config.target_language,
-                "cumulative_inrun_shapley_loss_change": score,
-                "cumulative_tokens": tokens,
-                "cumulative_sequences": float(self.cumulative_seen_sequences[i]),
-                "score_per_1m_tokens": score / max(tokens, 1.0) * 1_000_000.0,
-                "helpfulness_per_1m_tokens": -score / max(tokens, 1.0) * 1_000_000.0,
-            })
-        rows.sort(key=lambda r: r["cumulative_inrun_shapley_loss_change"])
-        return {
-            "config": asdict(self.config),
-            "num_attribute_steps": self.num_attribute_steps,
-            "rows": rows,
-        }
-
-    def write_jsonl(self, path: str | Path, record: Mapping[str, object]) -> None:
-        if not _is_global_rank0():
-            return
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"time": time.time(), **dict(record)}
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-    def write_summary_json(self, path: str | Path) -> None:
-        if not _is_global_rank0():
-            return
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(self.summary(), f, ensure_ascii=False, indent=2)
-
-
-MEGATRON_INTEGRATION_EXAMPLE = """
-# === 1) Add to your modified pretrain_gpt.py imports ===
 from megatron_inrun_language_shapley import (
     LanguageInRunShapley,
     LanguageShapleyConfig,
 )
 
-# === 2) Build after model is created ===
-languages = ["eng_Latn", "deu_Latn", "fra_Latn", "spa_Latn", "ita_Latn", "por_Latn", "zho_Hans"]
-shapley = LanguageInRunShapley(
-    model=model[0] if isinstance(model, list) else model,
-    config=LanguageShapleyConfig(
-        languages=languages,
-        target_language="zho_Hans",
-        attribute_every=args.shapley_attribute_every,
-        activation_layout="SBH",
-        include_bias=False,
-    ),
-    device=torch.device("cuda", torch.cuda.current_device()),
-)
+# ---------------------------------------------------------------------
+# In-Run Data Shapley global state
+# ---------------------------------------------------------------------
 
-# === 3) Define the Megatron forward adapter ===
-def forward_model_with_batch(batch):
-    return model(
+_SHAPLEY = None
+# _TARGET_VALID_ITERATOR = None
+_SHAPLEY_INITIALIZED = False
+
+
+stimer = StragglerDetector()
+
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+    """Builds the model.
+
+    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
+
+    Args:
+        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+
+
+    Returns:
+        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
+    """
+    args = get_args()
+    use_te = args.transformer_impl == "transformer_engine"
+
+    if args.record_memory_history:
+        torch.cuda.memory._record_memory_history(True,
+            # keep 100,000 alloc/free events from before the snapshot
+            trace_alloc_max_entries=100000,
+
+            # record stack information for the trace events
+            trace_alloc_record_context=True)
+
+        def oom_observer(device, alloc, device_alloc, device_free):
+            # snapshot right after an OOM happened
+            print('saving allocated state during OOM')
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
+            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'))
+
+        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
+
+    print_rank_0('building GPT model ...')
+    # Experimental loading arguments from yaml
+    if args.yaml_cfg is not None:
+        config = core_transformer_config_from_yaml(args, "language_model")
+    else:
+        config = core_transformer_config_from_args(args)
+
+    if args.use_legacy_models:
+        model = megatron.legacy.model.GPTModel(
+            config,
+            num_tokentypes=0,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process,
+        )
+    else: # using core models
+        if args.spec is not None:
+            transformer_layer_spec = import_module(args.spec)
+        else:
+            if args.num_experts:
+                # Define the decoder block spec
+                transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te, normalization=args.normalization)
+            elif args.heterogeneous_layers_config_path is not None:
+                transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
+            else:
+                # Define the decoder layer spec
+                if use_te:
+                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm)
+                else:
+                    transformer_layer_spec = get_gpt_layer_local_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm,
+                        normalization=args.normalization)
+        mtp_block_spec = None
+        if args.mtp_num_layers is not None:
+            mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, use_transformer_engine=use_te)
+
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.padded_vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent,
+            rotary_base=args.rotary_base,
+            rope_scaling=args.use_rope_scaling,
+            mtp_block_spec=mtp_block_spec,
+            z_loss_strength=args.z_loss_strength,
+        )
+
+    return model
+
+
+def get_batch(data_iterator):
+    """Generate a batch."""
+
+    # TODO: this is pretty hacky, find a better way
+    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
+        return None, None, None, None, None, None
+
+    # get batches based on the TP rank you are on
+    batch = get_batch_on_this_tp_rank(data_iterator)
+
+    # Metadata for In-Run Data Shapley.
+    # Do not pass these into the model forward.
+    language_id = batch.pop("language_id", None)
+    dataset_id = batch.pop("dataset_id", None)
+
+    # slice batch along sequence dimension for context parallelism
+    batch = get_batch_on_this_cp_rank(batch)
+
+    return (
         batch["tokens"],
-        batch["position_ids"],
+        batch["labels"],
+        batch["loss_mask"],
         batch["attention_mask"],
-        labels=batch["labels"],
-        loss_mask=batch["loss_mask"],
-        packed_seq_params=None,
+        batch["position_ids"],
+        language_id,
     )
 
-# === 4) In your training loop, every N iterations ===
-# train_batch must include language_id: shape [micro_batch_size].
-# val_batch comes from target-language held-out validation iterator.
-if shapley.should_attribute(iteration):
-    lr = optimizer.param_groups[0]["lr"]
-    record = shapley.attribute(
-        train_batch=train_batch,
-        val_batch=next(target_language_valid_iterator),
-        lr=lr,
-        iteration=iteration,
-        forward_model_with_batch=forward_model_with_batch,
-    )
-    shapley.write_jsonl(args.shapley_output_jsonl, record)
 
-# === 5) At checkpoint/end ===
-shapley.write_summary_json(args.shapley_summary_json)
-"""
+# define spiky loss as a loss that's 10x the max loss observed
+SPIKY_LOSS_FACTOR = 10
+
+
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
+    """Loss function.
+
+    Args:
+        loss_mask (torch.Tensor): Used to mask out some portions of the loss
+        output_tensor (torch.Tensor): The tensor with the losses
+
+    Returns:
+        the loss scalar for this micro-batch
+        the number of non-padded tokens in this microbatch
+        a dict containing reporting metrics on the loss and number of tokens across
+            the data parallel ranks
+    """
+    args = get_args()
+
+    losses = output_tensor.float()
+    loss_mask = loss_mask.view(-1).float()
+    total_tokens = loss_mask.sum()
+    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+
+    if args.context_parallel_size > 1:
+        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+
+    # Check individual rank losses are not NaN prior to DP all-reduce.
+    rerun_state_machine = get_rerun_state_machine()
+    if args.check_for_nan_in_loss_and_grad:
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isnan,
+            message="found NaN in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isinf,
+            message="found Inf in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
+    # Check for spiky loss
+    if args.check_for_spiky_loss:
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=partial(
+                rerun_state_machine.is_unexpectedly_large,
+                threshold=SPIKY_LOSS_FACTOR,
+                context="loss",
+            ),
+            message="Spiky loss",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=False,
+        )
+    # Reduce loss for logging.
+    reporting_loss = loss.clone().detach()
+    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
+
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
+    local_num_tokens = loss[1].clone().detach().to(torch.int)
+    return (
+        loss[0].clone(),
+        local_num_tokens,
+        {'lm loss': (reporting_loss[0], reporting_loss[1])},
+    )
+
+
+def forward_step(data_iterator, model: GPTModel):
+    """Forward training step.
+
+    Args:
+        data_iterator : Input data iterator
+        model (GPTModel): The GPT Model
+    """
+    args = get_args()
+    timers = get_timers()
+
+    # Get the batch.
+    timers('batch-generator', log_level=2).start()
+    global stimer
+    with stimer(bdata=True):
+        tokens, labels, loss_mask, attention_mask, position_ids, language_id = get_batch(data_iterator)
+    timers('batch-generator').stop()
+
+    # Keep the current training micro-batch for In-Run Data Shapley.
+    # language_id is metadata only and must not be passed into the model.
+    args._latest_train_batch_for_shapley = {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "language_id": language_id,
+    }
+
+    with stimer:
+        if args.use_legacy_models:
+            output_tensor = model(
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+            )
+        else:
+            output_tensor = model(
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+
+    return output_tensor, partial(loss_func, loss_mask)
+
+
+def _unwrap_model(model):
+    """Megatron sometimes passes model as a one-element list."""
+    return model[0] if isinstance(model, list) else model
+
+
+def _get_current_lr(optimizer) -> float:
+    """Best-effort extraction of the current learning rate from Megatron optimizer wrappers."""
+    if optimizer is None:
+        return float(os.environ.get("MEGATRON_INRUN_SHAPLEY_FALLBACK_LR", "0.0"))
+
+    if hasattr(optimizer, "param_groups") and optimizer.param_groups:
+        return float(optimizer.param_groups[0].get("lr", 0.0))
+
+    inner = getattr(optimizer, "optimizer", None)
+    if inner is not None and hasattr(inner, "param_groups") and inner.param_groups:
+        return float(inner.param_groups[0].get("lr", 0.0))
+
+    optimizers = getattr(optimizer, "optimizers", None)
+    if optimizers:
+        for opt in optimizers:
+            if hasattr(opt, "param_groups") and opt.param_groups:
+                return float(opt.param_groups[0].get("lr", 0.0))
+            inner = getattr(opt, "optimizer", None)
+            if inner is not None and hasattr(inner, "param_groups") and inner.param_groups:
+                return float(inner.param_groups[0].get("lr", 0.0))
+
+    return float(os.environ.get("MEGATRON_INRUN_SHAPLEY_FALLBACK_LR", "0.0"))
+
+
+def maybe_init_inrun_shapley(model):
+    """Initialize language-level In-Run Data Shapley once per process."""
+    global _SHAPLEY, _SHAPLEY_INITIALIZED
+
+    if _SHAPLEY_INITIALIZED:
+        return _SHAPLEY
+
+    enabled = os.environ.get("MEGATRON_INRUN_SHAPLEY_ENABLE", "0")
+    if enabled != "1":
+        _SHAPLEY_INITIALIZED = True
+        _SHAPLEY = None
+        print_rank_0("[InRunShapley] disabled.")
+        return None
+
+    args = get_args()
+
+    if getattr(args, "pipeline_model_parallel_size", 1) != 1:
+        print_rank_0(
+            "[InRunShapley] WARNING: pipeline_model_parallel_size > 1 detected. "
+            "This first integration is intended for PP=1. Attribution may be skipped or incorrect."
+        )
+
+    languages = [
+        x.strip()
+        for x in os.environ.get("MEGATRON_INRUN_SHAPLEY_LANGUAGES", "lang_a,lang_b,lang_c").split(",")
+        if x.strip()
+    ]
+    target_language = os.environ.get("MEGATRON_INRUN_SHAPLEY_TARGET_LANGUAGE", "lang_a")
+    attribute_every = int(os.environ.get("MEGATRON_INRUN_SHAPLEY_ATTRIBUTE_EVERY", "100"))
+    activation_layout = os.environ.get("MEGATRON_INRUN_SHAPLEY_ACTIVATION_LAYOUT", "SBH")
+
+    wrapped_model = _unwrap_model(model)
+
+    _SHAPLEY = LanguageInRunShapley(
+        model=wrapped_model,
+        config=LanguageShapleyConfig(
+            languages=languages,
+            target_language=target_language,
+            attribute_every=attribute_every,
+            activation_layout=activation_layout,
+            include_bias=False,
+        ),
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+
+    _SHAPLEY_INITIALIZED = True
+
+    print_rank_0(
+        f"[InRunShapley] initialized: target={target_language}, "
+        f"languages={languages}, attribute_every={attribute_every}, "
+        f"activation_layout={activation_layout}"
+    )
+
+    return _SHAPLEY
+
+
+def inrun_shapley_forward_model_with_batch(model):
+    """Adapter used by LanguageInRunShapley.attribute()."""
+    wrapped_model = _unwrap_model(model)
+
+    def _forward(batch):
+        args = get_args()
+
+        if args.use_legacy_models:
+            return wrapped_model(
+                batch["tokens"],
+                batch["position_ids"],
+                batch["attention_mask"],
+                labels=batch["labels"],
+            )
+
+        return wrapped_model(
+            batch["tokens"],
+            batch["position_ids"],
+            batch["attention_mask"],
+            labels=batch["labels"],
+            loss_mask=batch["loss_mask"],
+        )
+
+    return _forward
+
+
+def _build_validation_batch_for_shapley(valid_data_iterator):
+    """Fetch one Megatron validation micro-batch and convert it to a Shapley batch dict."""
+    if valid_data_iterator is None:
+        return None
+
+    # Reuse this file's get_batch() so TP/CP handling matches training.
+    tokens, labels, loss_mask, attention_mask, position_ids, _language_id = get_batch(valid_data_iterator)
+
+    if tokens is None:
+        return None
+
+    return {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+
+
+def maybe_run_inrun_shapley(iteration, model, optimizer, valid_data_iterator):
+    """Run one language-level In-Run Data Shapley attribution step if scheduled.
+
+    This function is intentionally kept outside forward_step(). It should be called
+    from Megatron's training loop after a normal training iteration is complete.
+
+    Required training.py hook, after iteration increments:
+        try:
+            from <this_script_module> import maybe_run_inrun_shapley
+            maybe_run_inrun_shapley(iteration, model, optimizer, valid_data_iterator)
+        except Exception as e:
+            print_rank_0(f"[InRunShapley] hook failed: {e}")
+    """
+    shapley = maybe_init_inrun_shapley(model)
+    if shapley is None:
+        return
+
+    if not shapley.should_attribute(int(iteration)):
+        return
+
+    args = get_args()
+
+    train_batch = getattr(args, "_latest_train_batch_for_shapley", None)
+    if train_batch is None:
+        print_rank_0(f"[InRunShapley] skipped at iteration={iteration}: no cached train batch.")
+        return
+
+    if train_batch.get("language_id", None) is None:
+        print_rank_0(f"[InRunShapley] skipped at iteration={iteration}: language_id is None.")
+        return
+
+    if valid_data_iterator is None:
+        print_rank_0(f"[InRunShapley] skipped at iteration={iteration}: valid_data_iterator is None.")
+        return
+
+    try:
+        val_batch = _build_validation_batch_for_shapley(valid_data_iterator)
+    except StopIteration:
+        print_rank_0(f"[InRunShapley] skipped at iteration={iteration}: valid iterator exhausted.")
+        return
+
+    if val_batch is None:
+        print_rank_0(f"[InRunShapley] skipped at iteration={iteration}: validation batch is None.")
+        return
+
+    lr = _get_current_lr(optimizer)
+    if lr == 0.0:
+        print_rank_0(
+            f"[InRunShapley] WARNING at iteration={iteration}: current lr resolved to 0.0. "
+            "Set MEGATRON_INRUN_SHAPLEY_FALLBACK_LR if this is unexpected."
+        )
+
+    try:
+        record = shapley.attribute(
+            train_batch=train_batch,
+            val_batch=val_batch,
+            lr=lr,
+            iteration=int(iteration),
+            forward_model_with_batch=inrun_shapley_forward_model_with_batch(model),
+        )
+    except Exception as e:
+        print_rank_0(f"[InRunShapley] ERROR at iteration={iteration}: {type(e).__name__}: {e}")
+        raise
+
+    output_jsonl = os.environ.get("MEGATRON_INRUN_SHAPLEY_OUTPUT_JSONL", "")
+    if output_jsonl:
+        shapley.write_jsonl(output_jsonl, record)
+
+    summary_json = os.environ.get("MEGATRON_INRUN_SHAPLEY_SUMMARY_JSON", "")
+    if summary_json:
+        shapley.write_summary_json(summary_json)
+
+    # Print a compact rank-0 progress line. Full values are written to JSONL.
+    print_rank_0(
+        f"[InRunShapley] attribution written at iteration={iteration}, "
+        f"target={record.get('target_language')}, lr={lr:.6e}"
+    )
+
+
+def is_dataset_built_on_rank():
+    return (
+        mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
+    ) and mpu.get_tensor_model_parallel_rank() == 0
+
+
+def core_gpt_dataset_config_from_args(args):
+    tokenizer = get_tokenizer()
+
+    # Sometimes --data-path is too long, instead we parse it from a file.
+    blend: Optional[Tuple[List[str], Optional[List[float]]]]
+    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
+
+    return GPTDatasetConfig(
+        random_seed=args.seed,
+        sequence_length=args.seq_length,
+        blend=blend,
+        blend_per_split=blend_per_split,
+        split=args.split,
+        num_dataset_builder_threads=args.num_dataset_builder_threads,
+        path_to_cache=args.data_cache_path,
+        mmap_bin_files=args.mmap_bin_files,
+        tokenizer=tokenizer,
+        reset_position_ids=args.reset_position_ids,
+        reset_attention_mask=args.reset_attention_mask,
+        eod_mask_loss=args.eod_mask_loss,
+        create_attention_mask=args.create_attention_mask_in_dataloader,
+        s3_cache_path=args.s3_cache_path,
+    )
+
+
+def train_valid_test_datasets_provider(train_val_test_num_samples):
+    """Build the train test and validation datasets.
+
+    Args:
+        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+    """
+    args = get_args()
+
+    config = core_gpt_dataset_config_from_args(args)
+
+    if args.mock_data:
+        dataset_type = MockGPTDataset
+    else:
+        dataset_type = GPTDataset
+
+    print_rank_0("> building train, validation, and test datasets for GPT ...")
+
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        dataset_type,
+        train_val_test_num_samples,
+        is_dataset_built_on_rank,
+        config
+    ).build()
+
+    print_rank_0("> finished creating GPT datasets ...")
+
+    return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":
-    print("This file is a Megatron-LM helper module, not a standalone trainer.")
-    print("Copy it into your Megatron-LM root and import LanguageInRunShapley.")
-    print(MEGATRON_INTEGRATION_EXAMPLE)
+
+    # Temporary for transition to core datasets
+    train_valid_test_datasets_provider.is_distributed = True
+
+    pretrain(
+        train_valid_test_datasets_provider,
+        model_provider,
+        ModelType.encoder_or_decoder,
+        forward_step,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
