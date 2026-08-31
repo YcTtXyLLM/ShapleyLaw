@@ -6,15 +6,6 @@ The goal of this repository is to make useful scripts, utilities, and examples p
 
 ## Repository Contents
 
-The repository may include:
-
-* Data processing scripts
-* Automation utilities
-* Research and analysis tools
-* Example code and demonstrations
-* Supporting scripts for ShapleyLaw projects
-
-More scripts and documentation may be added over time.
 
 ## Getting Started
 
