@@ -20,29 +20,9 @@ Please refer to the documentation or comments included with each script for spec
 
 ## Requirements
 
-Dependencies may vary between scripts.
-
-When applicable, dependency information will be provided through files such as:
-
-```text
-requirements.txt
-environment.yml
-pyproject.toml
-```
-
-or documented alongside the corresponding script.
 
 ## Usage
 
-Scripts in this repository are provided as standalone tools or examples unless otherwise specified.
-
-For example:
-
-```bash
-python path/to/script.py
-```
-
-Please check the individual script documentation before use.
 
 ## Contributing
 
