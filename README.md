@@ -12,7 +12,7 @@ The goal of this repository is to make useful scripts, utilities, and examples p
 Clone this repository:
 
 ```bash
-git clone https://github.com/<your-organization>/<repository-name>.git
+git clone https://github.com/YcTtXyLLM/ShapleyLaw.git
 cd <repository-name>
 ```
 
